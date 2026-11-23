@@ -12,28 +12,18 @@
 
 // ---------------------------------------------------------------- text rules
 
+const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESCAPE_RE = /[&<>"']/g;
+const HAS_ESCAPE_RE = /[&<>"']/;
+
 /**
  * `text` with & < > " and ' replaced by their HTML escapes, nothing else.
- * One pass over the code units, copying each plain run once; a text with no
- * special character is returned as it stands.
+ * Most texts hold no special character and are returned as they stand
+ * after one engine scan; the rest take one regex pass in which only a
+ * character that is actually replaced reaches the callback.
  */
 function escapeHtml(text) {
-  let start = 0;
-  let out = null;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    let rep = null;
-    if (c === 38) rep = '&amp;';
-    else if (c === 60) rep = '&lt;';
-    else if (c === 62) rep = '&gt;';
-    else if (c === 34) rep = '&quot;';
-    else if (c === 39) rep = '&#39;';
-    if (rep !== null) {
-      out = (out === null ? text.slice(0, i) : out + text.slice(start, i)) + rep;
-      start = i + 1;
-    }
-  }
-  return out === null ? text : out + text.slice(start);
+  return HAS_ESCAPE_RE.test(text) ? text.replace(ESCAPE_RE, (c) => ESCAPES[c]) : text;
 }
 
 const SLUG_MAX = 64;
@@ -98,12 +88,27 @@ function isSpaceCode(c) {
     c === 8287 || c === 12288 || c === 65279;
 }
 
+// Whitespace by code unit: exactly the set isSpaceCode names, as a table
+// (a Uint8Array read beats the chain of comparisons in the hot loop).
+const WS_TABLE = new Uint8Array(65536);
+for (let c = 9; c <= 13; c++) WS_TABLE[c] = 1;
+WS_TABLE[32] = 1;
+WS_TABLE[160] = 1;
+WS_TABLE[5760] = 1;
+for (let c = 8192; c <= 8202; c++) WS_TABLE[c] = 1;
+WS_TABLE[8232] = 1;
+WS_TABLE[8233] = 1;
+WS_TABLE[8239] = 1;
+WS_TABLE[8287] = 1;
+WS_TABLE[12288] = 1;
+WS_TABLE[65279] = 1;
+
 /** The words of a body: its runs of characters other than whitespace. */
 function wordsOf(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isSpaceCode(text.charCodeAt(i))) inWord = false;
+    if (WS_TABLE[text.charCodeAt(i)] === 1) inWord = false;
     else if (!inWord) { inWord = true; n++; }
   }
   return n;
@@ -399,6 +404,11 @@ function isContinued(line) {
 
 /** Whether `line` ends a paragraph: blank, a fence, a heading or a break. */
 function endsParagraph(line) {
+  // Every one of the four can only start with one of these code units
+  // (an empty line, a space or tab, ` # - or *); anything else is a plain
+  // continuation and skips all four scans.
+  const c = line.charCodeAt(0);
+  if (c !== 32 && c !== 9 && c !== 96 && c !== 35 && c !== 45 && c !== 42 && line.length !== 0) return false;
   return isBlankLine(line) || fenceLang(line) !== null || headingOf(line) !== null || isHR(line);
 }
 
@@ -422,13 +432,13 @@ function findUnescaped(s, what, from, hi) {
 /** The first single * in s[from, hi) (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from, hi) {
   for (let j = from; j < hi; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < hi && ESCAPABLE.has(s[j + 1])) {
+    const c = s.charCodeAt(j);
+    if (c === 92 && j + 1 < hi && ESCAPABLE.has(s[j + 1])) {
       j++;
       continue;
     }
-    if (c !== '*') continue;
-    if (j + 1 < hi && s[j + 1] === '*') {
+    if (c !== 42) continue;
+    if (j + 1 < hi && s.charCodeAt(j + 1) === 42) {
       j++;
       continue;
     }
@@ -447,75 +457,78 @@ function inlineInto(s, lo, hi, link, out) {
   let i = lo;
   let plain = lo;
   while (i < hi) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < hi && ESCAPABLE.has(s[i + 1])) {
-      if (i > plain) out.push(escapeHtml(s.slice(plain, i)));
-      out.push(escapeHtml(s[i + 1]));
-      i += 2;
-      plain = i;
-      continue;
-    }
-    if (c === '`') {
-      const j = s.indexOf('`', i + 1);
-      if (j !== -1 && j < hi && j > i + 1) {
+    // Only \ ` * and [ can open a construct; the search for the next one
+    // runs in the string engine, so the plain text between constructs is
+    // never walked a character at a time.
+    let j = s.indexOf('\\', i);
+    const jTick = s.indexOf('`', i);
+    if (jTick !== -1 && (j === -1 || jTick < j)) j = jTick;
+    const jStar = s.indexOf('*', i);
+    if (jStar !== -1 && (j === -1 || jStar < j)) j = jStar;
+    const jBrack = s.indexOf('[', i);
+    if (jBrack !== -1 && (j === -1 || jBrack < j)) j = jBrack;
+    if (j === -1 || j >= hi) break;
+    i = j;
+    const c = s.charCodeAt(i);
+    if (c === 92) { // '\'
+      if (i + 1 < hi && ESCAPABLE.has(s[i + 1])) {
         if (i > plain) out.push(escapeHtml(s.slice(plain, i)));
-        out.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
-        i = j + 1;
+        out.push(escapeHtml(s[i + 1]));
+        i += 2;
         plain = i;
-        continue;
-      }
-      i++;
+      } else i++;
       continue;
     }
-    if (c === '*') {
-      if (i + 1 < hi && s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2, hi);
-        if (j > i + 2) {
+    if (c === 96) { // '`'
+      const k = s.indexOf('`', i + 1);
+      if (k !== -1 && k < hi && k > i + 1) {
+        if (i > plain) out.push(escapeHtml(s.slice(plain, i)));
+        out.push('<code>', escapeHtml(s.slice(i + 1, k)), '</code>');
+        i = k + 1;
+        plain = i;
+      } else i++;
+      continue;
+    }
+    if (c === 42) { // '*'
+      if (i + 1 < hi && s.charCodeAt(i + 1) === 42) {
+        const k = findUnescaped(s, '**', i + 2, hi);
+        if (k > i + 2) {
           if (i > plain) out.push(escapeHtml(s.slice(plain, i)));
           out.push('<strong>');
-          inlineInto(s, i + 2, j, link, out);
+          inlineInto(s, i + 2, k, link, out);
           out.push('</strong>');
-          i = j + 2;
+          i = k + 2;
           plain = i;
-          continue;
-        }
-        i += 2;
+        } else i += 2;
         continue;
       }
-      const j = findSingleStar(s, i + 1, hi);
-      if (j > i + 1) {
+      const k = findSingleStar(s, i + 1, hi);
+      if (k > i + 1) {
         if (i > plain) out.push(escapeHtml(s.slice(plain, i)));
         out.push('<em>');
-        inlineInto(s, i + 1, j, link, out);
-        out.push('</em>');
-        i = j + 1;
-        plain = i;
-        continue;
-      }
-      i++;
-      continue;
-    }
-    if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1, hi);
-      let m = -1;
-      if (k !== -1 && k + 1 < hi && s[k + 1] === '(') {
-        m = s.indexOf(')', k + 2);
-        if (m >= hi) m = -1;
-      }
-      const target = m === -1 ? '' : s.slice(k + 2, m);
-      if (target !== '' && !WS_RE.test(target)) {
-        if (i > plain) out.push(escapeHtml(s.slice(plain, i)));
-        out.push('<a href="', escapeHtml(link(target)), '">');
         inlineInto(s, i + 1, k, link, out);
-        out.push('</a>');
-        i = m + 1;
+        out.push('</em>');
+        i = k + 1;
         plain = i;
-        continue;
-      }
-      i++;
+      } else i++;
       continue;
     }
-    i++;
+    // c === 91, '['
+    const k = findUnescaped(s, ']', i + 1, hi);
+    let m = -1;
+    if (k !== -1 && k + 1 < hi && s.charCodeAt(k + 1) === 40) { // '('
+      m = s.indexOf(')', k + 2);
+      if (m >= hi) m = -1;
+    }
+    const target = m === -1 ? '' : s.slice(k + 2, m);
+    if (target !== '' && !WS_RE.test(target)) {
+      if (i > plain) out.push(escapeHtml(s.slice(plain, i)));
+      out.push('<a href="', escapeHtml(link(target)), '">');
+      inlineInto(s, i + 1, k, link, out);
+      out.push('</a>');
+      i = m + 1;
+      plain = i;
+    } else i++;
   }
   if (hi > plain) out.push(escapeHtml(s.slice(plain, hi)));
 }
@@ -547,7 +560,11 @@ function renderBody(src, link, slugify) {
       i++;
       continue;
     }
-    const lang = fenceLang(line);
+    // A construct can only open on ` # - * > or a digit; a line opening
+    // on anything else is paragraph text and skips every probe below.
+    const c0 = line.charCodeAt(0);
+    const plain = c0 !== 96 && c0 !== 35 && c0 !== 45 && c0 !== 42 && c0 !== 62 && !(c0 >= 48 && c0 <= 57);
+    const lang = plain ? null : fenceLang(line);
     if (lang !== null) {
       i++;
       const parts = ['<pre><code'];
@@ -562,7 +579,7 @@ function renderBody(src, link, slugify) {
       blocks.push(parts.join(''));
       continue;
     }
-    const h = headingOf(line);
+    const h = plain ? null : headingOf(line);
     if (h !== null) {
       const id = uniqueSlug(slugify(h.text), ids);
       const html = inlineStr(h.text, link);
@@ -571,7 +588,7 @@ function renderBody(src, link, slugify) {
       i++;
       continue;
     }
-    if (isHR(line)) {
+    if (!plain && isHR(line)) {
       blocks.push('<hr>');
       i++;
       continue;
@@ -588,8 +605,8 @@ function renderBody(src, link, slugify) {
       blocks.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inlineStr(kept.join('\n'), link)}</p>\n</blockquote>`);
       continue;
     }
-    const b0 = bulletOf(line);
-    const o0 = b0 === null ? orderedOf(line) : null;
+    const b0 = plain ? null : bulletOf(line);
+    const o0 = b0 === null && !plain ? orderedOf(line) : null;
     if (b0 !== null || o0 !== null) {
       const isOrd = o0 !== null;
       const items = [];
@@ -812,9 +829,21 @@ function renderInto(nodes, scope, ctx, depth, out) {
         const xs = lookup(scope, nd.path);
         if (!Array.isArray(xs)) break;
         const len = xs.length;
+        // One scope for the whole loop, its fields rewritten per item:
+        // rendering is synchronous and nothing keeps the item or the
+        // loop record past its own iteration, so reuse is unobservable.
+        // (vars.loop is assigned after the item, as in a fresh literal,
+        // so an item itself named "loop" still loses to the record.)
+        const loop = { index: 0, first: false, last: false, length: len };
+        const vars = {};
+        const inner = { vars, parent: scope };
         for (let k = 0; k < len; k++) {
-          const vars = { [nd.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === len - 1, length: len } };
-          renderInto(nd.body, { vars, parent: scope }, ctx, depth, out);
+          vars[nd.name] = xs[k];
+          vars.loop = loop;
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === len - 1;
+          renderInto(nd.body, inner, ctx, depth, out);
         }
         break;
       }
@@ -853,13 +882,19 @@ function resolvePath(dir, rel) {
 
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
+/** A source's date in words, computed once and kept on the source. */
+function dateLongOf(s) {
+  if (s.dateLong === undefined) s.dateLong = s.data.date === undefined ? '' : longDate(s.data.date);
+  return s.dateLong;
+}
+
 /** A page's link record as templates read it. */
 function linkOf(s) {
   return s === null ? null : {
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+    date_long: dateLongOf(s),
   };
 }
 
@@ -869,11 +904,13 @@ function cardOf(s) {
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+    date_long: dateLongOf(s),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    // A tag's card record never changes once the tag exists, and one tag
+    // sits in many cards: build it once, on the tag itself.
+    tags: s.tagRefs.map((t) => t.cardTag ?? (t.cardTag = { name: t.name, slug: t.slug, url: t.url })),
   };
 }
 
@@ -925,7 +962,7 @@ export function run(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -985,21 +1022,37 @@ export function run(input) {
   const staticPaths = new Set();
   for (const f of statics) staticPaths.add(f.path);
   const broken = new Set();
+  // A target's resolution depends only on its directory: the same link
+  // written in twenty posts of one section resolves once per case.
+  const linkMemo = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
+    let dirMemo = linkMemo.get(dir);
+    if (dirMemo === undefined) {
+      dirMemo = new Map();
+      linkMemo.set(dir, dirMemo);
+    }
     const link = (target) => {
       if (SCHEME_RE.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
-      const hash = target.indexOf('#');
-      const rel = hash === -1 ? target : target.slice(0, hash);
-      const frag = hash === -1 ? '' : target.slice(hash);
-      const path = rel === '' ? null : resolvePath(dir, rel);
-      if (path !== null) {
-        const pg = bySource.get(path);
-        if (pg !== undefined) return `${pg.url}${frag}`;
-        if (staticPaths.has(path)) return `${base}/${path}${frag}`;
+      let r = dirMemo.get(target);
+      if (r === undefined) {
+        const hash = target.indexOf('#');
+        const rel = hash === -1 ? target : target.slice(0, hash);
+        const frag = hash === -1 ? '' : target.slice(hash);
+        const path = rel === '' ? null : resolvePath(dir, rel);
+        r = null;
+        if (path !== null) {
+          const pg = bySource.get(path);
+          if (pg !== undefined) r = `${pg.url}${frag}`;
+          else if (staticPaths.has(path)) r = `${base}/${path}${frag}`;
+        }
+        dirMemo.set(target, r);
       }
-      broken.add(`broken-link ${s.path} -> ${target}`);
-      return target;
+      if (r === null) {
+        broken.add(`broken-link ${s.path} -> ${target}`);
+        return target;
+      }
+      return r;
     };
     const md = renderBody(s.body, link, slugify);
     s.html = md.html;
